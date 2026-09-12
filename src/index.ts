@@ -3,7 +3,8 @@ import { mkdirSync, rmSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { config, isLocalApi } from './config.js';
 import { cutSegment, probeDuration } from './ffmpeg.js';
-import { parseCut, formatTime, segmentsFor } from './parse.js';
+import { parseCut, formatTime, segmentsFor, type CutRequest } from './parse.js';
+import { cutKeyboard, describeRequest, rangeHint } from './keyboard.js';
 import { enqueue, queueLength } from './queue.js';
 import { activeJobsOf, createJob, gatePassed, logEvent, markGatePassed, setJobStatus, stats } from './db.js';
 
@@ -59,13 +60,10 @@ bot.command('start', async (ctx) => {
   logEvent(ctx.from!, 'start');
   if (!(await gate(ctx))) return;
   await ctx.reply(
-    '🎬 Пришли видео (или documents-файлом) — нарежу его на сервере.\n\n' +
-      'После загрузки скажи, как резать:\n' +
-      '• от 1:30 до 2:45 — вырезать кусок\n' +
-      '• каждые 60 — резать по минуте (можно «каждые 2м», «каждые 30»)\n' +
-      '• поминутно\n' +
-      '• на 5 частей\n\n' +
-      (isLocalApi ? 'Размер — до 2 ГБ.' : '⚠️ Пока лимит 20 МБ (обычный Bot API).'),
+    '🎬 Пришли видео — и я нарежу его прямо здесь.\n\n' +
+      'После загрузки просто нажмёшь кнопку: по минуте, на равные части, каждые N секунд ' +
+      'или вырезать один кусок.\n\n' +
+      (isLocalApi ? 'Размер — до 2 ГБ, длина любая.' : '⚠️ Пока лимит 20 МБ.'),
   );
 });
 
@@ -115,14 +113,41 @@ bot.on(['message:video', 'message:document', 'message:video_note', 'message:anim
     await ctx.api.editMessageText(
       ctx.chat.id,
       status.message_id,
-      `✅ Видео принято: ${formatTime(duration)}.\n\nКак резать?\n• от 1:30 до 2:45\n• каждые 60\n• поминутно\n• на 5 частей`,
+      `✅ Видео принято — ${formatTime(duration)}.\n\nВыбери, как нарезать 👇`,
+      { reply_markup: cutKeyboard(duration) },
     );
   } catch (e) {
     await ctx.api.editMessageText(ctx.chat.id, status.message_id, `❌ Не смог принять файл: ${String(e instanceof Error ? e.message : e).slice(0, 200)}`).catch(() => {});
   }
 });
 
-// ── Команда нарезки текстом ────────────────────────────────────────────────
+// ── Кнопки нарезки ──────────────────────────────────────────────────────────
+bot.callbackQuery(/^cut:(.+)$/, async (ctx) => {
+  const p = waiting.get(ctx.from.id);
+  if (!p) {
+    await ctx.answerCallbackQuery({ text: 'Пришли видео заново — старое я уже убрал.', show_alert: true });
+    await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
+    return;
+  }
+  const arg = ctx.match![1];
+  if (arg === 'range') {
+    await ctx.answerCallbackQuery();
+    await ctx.reply(rangeHint(p.duration));
+    return;
+  }
+  let req: CutRequest;
+  if (arg.startsWith('every:')) req = { kind: 'every', seconds: Number(arg.slice(6)) };
+  else if (arg.startsWith('parts:')) req = { kind: 'parts', n: Number(arg.slice(6)) };
+  else {
+    await ctx.answerCallbackQuery();
+    return;
+  }
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {}); // убираем кнопки — выбор сделан
+  await launchCut(ctx, req);
+});
+
+// ── Ввод диапазона текстом (после кнопки «Вырезать кусок» или напрямую) ──────
 bot.on('message:text', async (ctx) => {
   if (ctx.chat.type !== 'private') return;
   const text = ctx.message.text.trim();
@@ -133,19 +158,29 @@ bot.on('message:text', async (ctx) => {
     await ctx.reply('Сначала пришли видео 🎬');
     return;
   }
-
   const req = parseCut(text, p.duration);
   if ('error' in req) {
-    await ctx.reply('❌ ' + req.error);
+    await ctx.reply('❌ ' + req.error, { reply_markup: cutKeyboard(p.duration) });
+    return;
+  }
+  await launchCut(ctx, req);
+});
+
+// Общий запуск нарезки: и с кнопки, и с текста. Читает ожидающее видео этого человека.
+async function launchCut(ctx: Context, req: CutRequest): Promise<void> {
+  const from = ctx.from!;
+  const p = waiting.get(from.id);
+  if (!p) {
+    await ctx.reply('Сначала пришли видео 🎬');
     return;
   }
   const segs = segmentsFor(req, p.duration);
   if (segs.length === 0) {
-    await ctx.reply('Ничего не получилось нарезать — проверь тайм-коды.');
+    await ctx.reply('Ничего не получилось нарезать — попробуй другой вариант.', { reply_markup: cutKeyboard(p.duration) });
     return;
   }
   if (segs.length > 500) {
-    await ctx.reply(`Это ${segs.length} кусков — слишком много. Возьми интервал побольше.`);
+    await ctx.reply(`Это ${segs.length} кусков — слишком много. Возьми интервал побольше.`, { reply_markup: cutKeyboard(p.duration) });
     return;
   }
   // На человека — одна активная задача за раз, чтобы очередь не забивал один пользователь.
@@ -157,9 +192,10 @@ bot.on('message:text', async (ctx) => {
   waiting.delete(from.id);
   const jobId = createJob(from, p.duration, req.kind, segs.length);
   const place = queueLength();
+  const word = segs.length === 1 ? 'кусок' : segs.length < 5 ? 'куска' : 'кусков';
   await ctx.reply(
-    `🧾 Принял: ${segs.length} ${segs.length === 1 ? 'кусок' : 'кусков'}.` +
-      (place >= config.maxConcurrent ? `\n⏳ Ты в очереди, впереди задач: ${place}. Режу по одной — подожди.` : '\n✂️ Начинаю…'),
+    `🧾 ${describeRequest(req)} → ${segs.length} ${word}.` +
+      (place >= config.maxConcurrent ? `\n⏳ Ты в очереди, впереди: ${place}. Режу по одной, подожди.` : '\n✂️ Начинаю…'),
   );
 
   enqueue(async () => {
@@ -183,7 +219,7 @@ bot.on('message:text', async (ctx) => {
       }
       logEvent(from, 'done', `${sent}/${segs.length}`);
       setJobStatus(jobId, 'done', `${sent}/${segs.length}`);
-      await ctx.reply(`✅ Готово: ${sent} ${sent === 1 ? 'кусок' : 'кусков'}.`);
+      await ctx.reply(`✅ Готово: ${sent} ${sent === 1 ? 'кусок' : 'кусков'}. Пришли новое видео, если надо ещё.`);
     } catch (e) {
       const msg = String(e instanceof Error ? e.message : e).slice(0, 300);
       logEvent(from, 'cut_err', msg);
@@ -194,7 +230,7 @@ bot.on('message:text', async (ctx) => {
       rmSync(p.hostPath, { force: true }); // исходник тоже удаляем сразу
     }
   });
-});
+}
 
 bot.catch((err) => console.error('Ошибка нарезчика:', err.error));
 process.once('SIGINT', () => bot.stop());
